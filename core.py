@@ -95,18 +95,38 @@ def numbered_prompt(head, items, categories):
 
 
 def parse_labels(reply, expected, categories):
+    """Read `<number>. <category>` back, tolerant of the noise small models add:
+    a trailing period, backticks, a parenthetical, or the label restated in a
+    sentence. Match the first category word that appears in the line rather than
+    demanding it be the only token, and never invent a label that is missing."""
+    import re
     found: dict[int, str] = {}
+    ordered: list[str] = []
     for line in reply.splitlines():
         line = line.strip().lstrip("-*").strip()
-        if not line or "." not in line:
+        if not line:
             continue
-        head, _, tail = line.partition(".")
-        if not head.strip().isdigit():
+        head, sep, tail = line.partition(".")
+        num = int(head.strip()) if head.strip().isdigit() and sep else None
+        text = tail if num is not None else line
+        words = re.findall(r"[a-z]+", text.lower())
+        label = next((w for w in words if w in categories), "")
+        if not label:
             continue
-        label = tail.strip().strip("`").lower().split()[0] if tail.strip() else ""
-        if label in categories:
-            found[int(head.strip())] = label
-    return [found.get(i + 1, "unclassified") for i in range(expected)]
+        if num is not None:
+            found[num] = label
+        else:
+            ordered.append(label)
+    # Fall back to positional order for replies that dropped the numbering.
+    out = []
+    for i in range(expected):
+        if i + 1 in found:
+            out.append(found[i + 1])
+        elif i < len(ordered):
+            out.append(ordered[i])
+        else:
+            out.append("unclassified")
+    return out
 
 
 def classify(items, backend, categories, head, limit, batch_size):
