@@ -1,0 +1,7 @@
+# Anahtar malzemesi ve calisma ciktisi asla commit edilmez
+seed.txt
+did.txt
+fp.txt
+spend.jsonl
+agent.log
+__pycache__/
