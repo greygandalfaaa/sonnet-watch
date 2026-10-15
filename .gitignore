@@ -5,3 +5,5 @@ fp.txt
 spend.jsonl
 agent.log
 __pycache__/
+chain-seed.txt
+chain-account.txt

@@ -201,18 +201,20 @@ class OpenAICompatBackend(Backend):
 
 
 class FlopBackend(Backend):
-    """The shape a Flop session request will take.
+    """Buys inference on the Flop network over a compute channel.
 
-    Per the draft whitepaper a request pins five fields — model-weight hash, max
-    latency, compute in FLOPs, a confidentiality flag, and the fee — a miner
-    accepts and returns a proof of useful inference, and the agent settles in
-    FLOP. `session_request` below builds exactly that, so the fields are already
-    being computed against real jobs.
+    Only settled spend counts: the Yellow Paper scores an agent on the gross
+    `payable` of compute-channel sessions settled on chain (R8.4, R8.7). The
+    agent's half of that protocol lives in flopwire.py — the channel id it
+    opens, checking each turn the miner signs, acknowledging it, and signing the
+    receipt that authorises the payout — and is checked against the public
+    wire-format vectors (test_flopwire.py).
 
-    It cannot run yet: Flop Testnet is Q4 2026, the Yellow Paper is not final,
-    and no faucet, client or published weight hash exists. Refusing here is the
-    honest answer; a stub that pretended to spend would put a false figure in
-    the ledger, which is the one thing the ledger exists to prevent.
+    The network half is not written: no testnet RPC or miner endpoint has been
+    published. Until FLOP_RPC_URL and FLOP_MINER_URL are set and a transport
+    exists, this backend refuses rather than pretending to spend; a stub that
+    pretended would put a false figure in the ledger, which is the one thing
+    the ledger exists to prevent.
     """
 
     name = "flop"
@@ -220,15 +222,26 @@ class FlopBackend(Backend):
 
     def __init__(self, model: str, weight_hash: str = "",
                  max_latency_ms: int = 60_000, confidential: bool = False,
-                 fee: float = 0.0) -> None:
+                 fee: float = 0.0, rpc_url: str = "", miner_url: str = "",
+                 account_seed_file: str = "") -> None:
         self.model = model
         self.weight_hash = weight_hash
         self.max_latency_ms = max_latency_ms
         self.confidential = confidential
         self.fee = fee
+        self.rpc_url = rpc_url
+        self.miner_url = miner_url
+        self.account_seed_file = Path(account_seed_file) if account_seed_file else HERE / "chain-seed.txt"
+
+    def account(self):
+        """This agent's sr25519 chain keypair. Flop accounts are sr25519, so this is
+        a key of its own, separate from the ed25519 did:key used on Technocore."""
+        import flopwire
+        seed = bytes.fromhex(self.account_seed_file.read_text(encoding="utf-8").strip())
+        return flopwire.keypair_from_seed(seed)
 
     def available(self) -> bool:
-        return False
+        return bool(self.rpc_url and self.miner_url and self.account_seed_file.exists())
 
     def session_request(self, prompt: str, max_tokens: int) -> dict:
         tokens = estimate_tokens(prompt) + max_tokens
@@ -241,11 +254,46 @@ class FlopBackend(Backend):
         }
 
     def run(self, prompt: str, max_tokens: int) -> tuple[str, Usage]:
-        raise NotImplementedError(
-            "Flop Testnet is Q4 2026: no mempool to post a session request to, "
-            "no faucet, and no published model-weight hash. "
-            f"The request this job would post: {self.session_request(prompt, max_tokens)}"
-        )
+        if not self.available():
+            raise NotImplementedError(
+                "Flop testnet is not open: no RPC or miner endpoint to open a channel with. "
+                f"The request this job would post: {self.session_request(prompt, max_tokens)}"
+            )
+        return self._session(prompt, max_tokens)
+
+    def _session(self, prompt: str, max_tokens: int) -> tuple[str, Usage]:
+        """One session: open a channel, send the job, check the miner's signed turns,
+        acknowledge them, sign the receipt over the transcript root, and settle.
+
+        The transport (open_channel, send, quote, settle) is what the testnet will
+        define, so testnet day is a transport to write, not a rewrite of this."""
+        import flopwire as fw
+        t = load_transport(self.rpc_url, self.miner_url)
+        public, _secret = kp = self.account()
+        opened = t.open_channel(public, self.session_request(prompt, max_tokens))
+        chan, miner = opened["channel_id"], opened["miner"]
+        if chan != fw.channel_id(opened["genesis"], public, miner, opened["nonce"]):
+            raise fw.WireError("channel id does not bind this agent, miner and nonce")
+        send_ms = int(time.time() * 1000)
+        reply, blob = t.send(chan, prompt, max_tokens)
+        recv_ms = int(time.time() * 1000)
+        turns = fw.check_transcript(blob, chan, miner, public)
+        for turn in turns:
+            t.ack(chan, turn.leaf.turn_index, fw.sign(
+                kp, fw.ack_preimage(chan, turn.leaf.turn_index, turn.leaf.hash(), send_ms, recv_ms)))
+        root = fw.merkle_root([turn.leaf.hash() for turn in turns])
+        g_n = sum(turn.leaf.g_n for turn in turns)
+        payable = t.quote(chan, g_n)
+        t.settle(chan, root, g_n, payable, fw.sign(kp, fw.receipt_preimage(chan, root, g_n, payable)))
+        # Money is in base units of 10^-18 FLOP; the ledger records FLOP.
+        return reply, self._usage(prompt, reply, 0, cost=payable / 10**18)
+
+
+def load_transport(rpc_url: str, miner_url: str):
+    """The Flop testnet client: chain RPC for open_channel/settle and the miner's
+    session endpoint. Neither has been published, so there is nothing to load."""
+    raise NotImplementedError(
+        f"No Flop testnet transport is published yet (rpc={rpc_url!r}, miner={miner_url!r}).")
 
 
 def choose_backend(name: str = "") -> Backend:
@@ -273,7 +321,10 @@ def choose_backend(name: str = "") -> Backend:
         if b.available():
             return b
     if name == "flop":
-        return FlopBackend(model, os.environ.get("FLOP_WEIGHT_HASH", ""))
+        return FlopBackend(model, os.environ.get("FLOP_WEIGHT_HASH", ""),
+                           rpc_url=os.environ.get("FLOP_RPC_URL", ""),
+                           miner_url=os.environ.get("FLOP_MINER_URL", ""),
+                           account_seed_file=os.environ.get("FLOP_ACCOUNT_SEED_FILE", ""))
     return Backend()
 
 
